@@ -1,0 +1,8 @@
+smbus2
+spidev
+colorlog
+adafruit-blinka
+gpiod
+adafruit-platformdetect
+adafruit-circuitpython-ads1x15
+astral
