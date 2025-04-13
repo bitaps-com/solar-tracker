@@ -2,7 +2,6 @@ import logging
 import asyncio
 import colorlog
 import traceback
-import signal
 import sys
 import spidev
 from collections import deque
@@ -16,8 +15,9 @@ from datetime import date
 from astral import LocationInfo
 from astral.sun import sun
 from datetime import datetime
+from aiohttp import web
 
-class App:
+class Tracker:
 	
     def __init__(self, loop, logger):
         self.loop = loop
@@ -25,6 +25,7 @@ class App:
         self.position_limit = 62 
         self.tolerance = 0.3
         self.auto_position = True
+        self.day = False
         self.motor_active = 0
         self.motor_start_timestamp = 0
         self.motor_start_position = 0
@@ -79,9 +80,8 @@ class App:
         self.c2_load = 0
         self.overload = None
         self.log.info("Solar tracker starting ...")
-        signal.signal(signal.SIGINT, self.terminate)
-        signal.signal(signal.SIGTERM, self.terminate)
         self.loop.create_task(self.start())
+
         
         
     async def start(self):
@@ -120,7 +120,30 @@ class App:
         return True
     
 
+    def set_manual_position(self, position):
+        if self.auto_position:
+            return False
+        if abs(position)<=self.position_limit:
+            self.target_position = position
+            return True
+        else:
+            return False
+            
+    async def manual_mode(self):
+        while not self.auto_position:
+            self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
+            self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
+            await asyncio.sleep(0.5)
+            self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+            self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+            await asyncio.sleep(0.5)
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
+        
+    
+
     async def position_controller(self):
+       last_position = 999
        while not self.shutdown:
            day = date.today()
            if day != self.today:
@@ -131,24 +154,39 @@ class App:
                self.log.info("Sunset: %s" % str(self.sun['sunset']))
                self.day_length = int((self.sun['sunset'] - self.sun['sunrise']).total_seconds())
                self.log.info("Day seconds: %s" % self.day_length)
-
+           c = datetime.now().timestamp() - self.sun['sunrise'].timestamp()
+           step = self.day_length / (self.position_limit * 2)
+           if c < 0 or c > self.day_length:
+               self.day = False
+           else:
+               self.day = True
+               
            if self.auto_position:
-               step = self.day_length / (self.position_limit * 2)
-               c = datetime.now().timestamp() - self.sun['sunrise'].timestamp()
-               if c > self.day_length:
+               if not self.day:
                    self.target_position = 0
-                   self.log.info("Auto position: night position")
+                   if c < 0:
+                       self.log.info("Auto position: night position Sleep until sunrise Zzzzz....")
+                       await asyncio.sleep(abs(c))
+                   else:
+                       self.log.info("Auto position: night position Zzzzzz...")
+                       await asyncio.sleep(2 * 3600)
                else:
                    s = int(self.day_length - c)
                    step_offset = int(c / step)
                    position = -1 * self.position_limit + step_offset
-                   self.log.info("Auto position: day %s degree %s h %s m left" % 
-                                (position, s // 3600, (s - (3600 * (s // 3600))) // 60))
+                   if position != last_position:
+                       last_position = position
+                       self.log.info("Day auto position: %s° %s:%s until sunset" % 
+                                    (position, s // 3600, (s - (3600 * (s // 3600))) // 60))
                    if position > self.position_limit:
                        position = self.position_limit
                    if position < (-1 * self.position_limit):
                       position = -1 * self.position_limit
                    self.target_position = position
+           else:
+               last_position = 0
+               await asyncio.sleep(1)
+               continue
            await asyncio.sleep(90)
 		   
     async def stop_motor(self):
@@ -156,7 +194,7 @@ class App:
         self.lines.set_value(self.L_PWM_OFFSET, gpiod.line.Value.INACTIVE)
         if self.motor_active:
             d = abs(round(self.motor_start_position - self.position,2))
-            self.log.debug("Motor stopped, stop %s, total %s" % (self.target_position, d))
+            self.log.debug("Motor stop %s°, moved %s°" % (self.position, d))
         self.motor_active = 0
         self.motor_start_timestamp = 0
         await asyncio.sleep(1)
@@ -168,7 +206,7 @@ class App:
                 self.motor_start_timestamp = int(time.time())
                 self.motor_start_position = self.position
                 self.lines.set_value(ch, gpiod.line.Value.ACTIVE)
-                self.log.debug("Motor started, start: %s target: %s" % 
+                self.log.debug("Motor start: %s° target: %s°" % 
                               (self.position, self.target_position))
             else:
                 self.log.error("Motor start failed:" + self.error_msg)
@@ -203,7 +241,7 @@ class App:
             if not self.error and max(data) > self.overload_value:
                 await self.stop_motor()
                 self.error = True
-                self.error_msg = "Motor overload: %s position: %s" % (max(data), self.position)
+                self.error_msg = "Motor overload: %s° position: %s°" % (max(data), self.position)
                 self.log.error(self.error_msg)
             # adxl 
             if self.motor_active:
@@ -250,66 +288,99 @@ class App:
 
            await asyncio.sleep(0.1)
 
-
-    def _exc(self, a, b, c):
-        return
-
-    def terminate(self, a, b):
-        if not self.shutdown:
-            self.shutdown = True
-            self.loop.create_task(self.terminate_coroutine())
-        else:
-            if not self.force_shutdown:
-                self.log.critical("Shutdown in progress please wait ... (or press CTRL + C to force shutdown)")
-                self.force_shutdown = True
-            else:
-                self.log.critical("Force shutdown ...")
-                if not self.lines_released:
-                    try:
-                        self.lines.set_value(self.R_PWM_OFFSET, gpiod.line.Value.INACTIVE)
-                        self.lines.set_value(self.L_PWM_OFFSET, gpiod.line.Value.INACTIVE)
-                        self.lines.release()
-                        self.log.critical("Motor lines released")
-                    except Exception as err:
-                        self.log.critical("Motor release exception:" + str(err))
-                sys.exit(0)
-
     async def terminate_coroutine(self):
         try:
             self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
             self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
             self.lines.set_value(self.L_PWM_OFFSET, gpiod.line.Value.INACTIVE)
-            self.lines.set_value(self.L_PWM_OFFSET, gpiod.line.Value.INACTIVE)
+            self.lines.set_value(self.R_PWM_OFFSET, gpiod.line.Value.INACTIVE)
             await asyncio.sleep(0.2)
             self.lines.release()
             self.log.error("Motor lines released")
         except Exception as err:
             self.log.critical("Motor release exception:" + str(err))
-        sys.excepthook = self._exc
         self.log.error('Stop request received')
-        self.loop.stop()
         self.log.info("Server has been stopped")
 		
 
+async def default(request):
+    data = {"message": "solar tracker v1.0"}
+    return web.json_response(data)
 
+async def status(request):
+    data = {
+        "day": request.app["tracker"].day,
+        "error": request.app["tracker"].error,
+        "position": request.app["tracker"].position,
+        "motor_active": request.app["tracker"].motor_active,
+        "auto_position": request.app["tracker"].auto_position}
+    if request.app["tracker"].error:
+        data["status"] = "error"
+        data["error_message"] = request.app["tracker"].error_message
+    else:
+        data["status"] = "ok"
+    return web.json_response(data)
+    
+async def set_manual_mode(request):
+    if request.app["tracker"].auto_position:
+        request.app["tracker"].auto_position = False
+        request.app["loop"].create_task(request.app["tracker"].manual_mode())
+    return web.json_response({"status":"ok"})
+    
+async def set_auto_mode(request):
+    request.app["tracker"].auto_position = True
+    return web.json_response({"status":"ok"})
+    
+async def set_position(request):
+    if not request.app["tracker"].auto_position:
+        try:
+            data = await request.json()
+            position = int(data.get("position"))
+            r = request.app["tracker"].set_manual_position(position)
+            if r:
+                return web.json_response({"status":"ok"})
+            else:
+                return web.json_response({"status":"ok"})
+        except Exception as err:
+            return web.json_response({"status":"failed",
+		                              "message": str(err)},
+		                              status = 400)
+    else:
+        return web.json_response({"status":"failed",
+	                              "message": "Not in manual mode"}, 
+	                              status = 400)
+    
+
+async def on_startup(api):
+	api["tracker"] = Tracker(api["loop"], api["logger"] )
+async def on_shutdown(api):
+	await api["tracker"].terminate_coroutine()
 
 if __name__ == '__main__':
-	log_level = logging.DEBUG
-	logger = colorlog.getLogger("trx")
-	logger.setLevel(log_level)
-	ch = logging.StreamHandler()
-	ch.setLevel(log_level)
-	formatter = colorlog.ColoredFormatter('%(log_color)s%(asctime)s: %(message)s')
-	ch.setFormatter(formatter)
-	logger.addHandler(ch)
+    log_level = logging.DEBUG
+    logger = colorlog.getLogger("trx")
+    logger.setLevel(log_level)
+    ch = logging.StreamHandler()
+    ch.setLevel(log_level)
+    formatter = colorlog.ColoredFormatter('%(log_color)s%(asctime)s: %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    loop = asyncio.get_event_loop()
+    api = web.Application()
+    api["logger"] = logger
+    api["loop"]=loop
+    api.add_routes([web.get('/', default)])
+    api.add_routes([web.get('/status', status)])
+    api.add_routes([web.post('/set/auto/mode', set_auto_mode)])
+    api.add_routes([web.post('/set/manual/mode', set_manual_mode)])
+    api.add_routes([web.post('/set/position', set_position)])
+    
 
-	loop = asyncio.get_event_loop()
-	app = App(loop, logger)
-	loop.run_forever()
+    api.on_startup.append(on_startup)
+    api.on_shutdown.append(on_shutdown)
+    web.run_app(api, port=9000, loop=loop)
+    
+    
 
-	pending = asyncio.Task.all_tasks()
-	for task in pending:
-		task.cancel()
-	if pending:
-		loop.run_until_complete(asyncio.wait(pending))
-	loop.close()
+
+
