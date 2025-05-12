@@ -9,7 +9,7 @@ import gpiod
 import time
 import board
 import busio
-import adafruit_ads1x15.ads1015 as ADS
+import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 from datetime import date
 from astral import LocationInfo
@@ -29,7 +29,7 @@ class Tracker:
         self.motor_active = 0
         self.motor_start_timestamp = 0
         self.motor_start_position = 0
-        self.correction = -9
+        self.correction = 5
         self.error = False
         self.error_msg = ""
         self.R_PWM_OFFSET = 18
@@ -56,8 +56,8 @@ class Tracker:
                        consumer = "pwm-control",
                        config = {self.L_PWM_OFFSET: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT),
                                  self.R_PWM_OFFSET: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT),
-                                 self.RED_LED: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, active_low = True),
-                                 self.GREEN_LED: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, active_low = True)})    
+                                 self.RED_LED: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, active_low = False),
+                                 self.GREEN_LED: gpiod.LineSettings(direction=gpiod.line.Direction.OUTPUT, active_low = False)})    
         self.lines_released = False
 
         self.overload_value = 4
@@ -73,7 +73,7 @@ class Tracker:
         self.write_register(0x2D, 0x08)  # POWER_CTL: Measurement mode
         self.write_register(0x31, 0x08)  # DATA_FORMAT: Full resolution, ±2g
         self.i2c = busio.I2C(board.SCL, board.SDA)
-        self.ads = ADS.ADS1015(self.i2c)
+        self.ads = ADS.ADS1115(self.i2c)
         self.c1 = AnalogIn(self.ads, ADS.P0, ADS.P1)
         self.c2 = AnalogIn(self.ads, ADS.P2, ADS.P3)
         self.c1_load = 0
@@ -85,6 +85,16 @@ class Tracker:
         
         
     async def start(self):
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+        await asyncio.sleep(2)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
+        await asyncio.sleep(2)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
+        await asyncio.sleep(2)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
         self.loop.create_task(self.watchdog())
         self.loop.create_task(self.position_monitoring())
         self.loop.create_task(self.position_controller())
@@ -140,8 +150,6 @@ class Tracker:
         self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
         self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
         
-    
-
     async def position_controller(self):
        last_position = 999
        while not self.shutdown:
@@ -213,7 +221,6 @@ class Tracker:
                 await self.stop_motor()
                 await asyncio.sleep(60)
           
-
     async def position_sync(self):
        while not self.shutdown:
            if not self.is_in_target_position():
@@ -231,13 +238,16 @@ class Tracker:
            await asyncio.sleep(0.2)
        await self.stop_motor()
 
-
     async def watchdog(self):
         motor_start = 0
         led_status = 0
         while not self.shutdown:
             # motor overload protection
             data = await self.read_ads_async()
+            if not self.error and data[0]==data[1]==0:
+                self.error = True
+                self.error_msg = "ADS sensor zerro"
+                self.log.error(self.error_msg)
             if not self.error and max(data) > self.overload_value:
                 await self.stop_motor()
                 self.error = True
@@ -260,15 +270,18 @@ class Tracker:
                     motor_start = self.motor_start_timestamp
                     adxl_watchdog = int(time.time())
                     position_watchdog = self.position
-            if self.error and led_status != 0:
+            if self.error and led_status == 1:
                 led_status = 0
                 self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
                 self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
-            if not self.error and led_status == 0:
+            if not self.error and led_status != 1:
                 led_status = 1
                 self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
-                self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
-					
+                self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+            if self.error and led_status != 2:
+                led_status = 2
+                self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+                self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)			
             await asyncio.sleep(0.1)
 
             

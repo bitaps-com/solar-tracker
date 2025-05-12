@@ -7,3 +7,4 @@ adafruit-platformdetect
 adafruit-circuitpython-ads1x15
 astral
 aiohttp
+lgpio
