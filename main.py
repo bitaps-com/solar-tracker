@@ -26,6 +26,7 @@ class Tracker:
         self.tolerance = 0.3
         self.auto_position = True
         self.day = False
+        self.night = False
         self.motor_active = 0
         self.motor_start_timestamp = 0
         self.motor_start_position = 0
@@ -87,12 +88,9 @@ class Tracker:
     async def start(self):
         self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
         self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
-        await asyncio.sleep(2)
         self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
-        await asyncio.sleep(2)
-        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
         self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
-        await asyncio.sleep(2)
+        await asyncio.sleep(4)
         self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
         self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
         self.loop.create_task(self.watchdog())
@@ -150,6 +148,21 @@ class Tracker:
         self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
         self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
         
+    async def night_mode(self):
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+        while self.night and not self.error:
+            self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
+            await asyncio.sleep(1)
+            self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+            await asyncio.sleep(3)
+        self.lines.set_value(self.GREEN_LED, gpiod.line.Value.INACTIVE)
+        self.lines.set_value(self.RED_LED, gpiod.line.Value.INACTIVE)
+        if not self.error:
+            self.lines.set_value(self.GREEN_LED, gpiod.line.Value.ACTIVE)
+        else:
+            self.lines.set_value(self.RED_LED, gpiod.line.Value.ACTIVE)
+        
     async def position_controller(self):
        last_position = 999
        while not self.shutdown:
@@ -172,13 +185,13 @@ class Tracker:
            if self.auto_position:
                if not self.day:
                    self.target_position = 0
-                   if c < 0:
+                   if not self.night:
                        self.log.info("Auto position: night position Sleep until sunrise Zzzzz....")
-                       await asyncio.sleep(abs(c))
-                   else:
-                       self.log.info("Auto position: night position Zzzzzz...")
-                       await asyncio.sleep(2 * 3600)
+                       self.loop.create_task(self.night_mode())
+                       self.night = True
                else:
+                   if self.night:
+                       self.night = False
                    s = int(self.day_length - c)
                    step_offset = int(c / step)
                    position = -1 * self.position_limit + step_offset
@@ -298,7 +311,6 @@ class Tracker:
            x = x + self.correction 
            self.position_stack.append(x)
            self.position = round((sum(self.position_stack)/len(self.position_stack))* 0.28, 1)
-
            await asyncio.sleep(0.1)
 
     async def terminate_coroutine(self):
